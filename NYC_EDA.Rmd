@@ -1,0 +1,937 @@
+---
+output:
+  pdf_document: default
+  dev: 'png'
+  number_sections: true
+  fig_width: 7
+  fig_height: 4.5
+  theme: "cosmo"
+  linkcolor: "cyan"
+  
+---
+
+# TAXI TAXI - A beginner approach on Exploratory Analysis#
+Suresh  
+Date- `r Sys.Date()`  
+
+```{r fig.align = 'default', warning = FALSE, out.width="100%", echo=FALSE}
+knitr::include_graphics("Taxi2.jpg", auto_pdf = TRUE)
+```
+
+```{r Set_memory, message=FALSE, echo=FALSE}
+# to resolve memory issue
+memory.limit(size = 56000)
+```
+ 
+```{r remove_junk, message=FALSE, echo=FALSE}
+# to resolve ggmap table error during execution.
+if (exists(".GeocodedInformation")) {
+  rm(.GeocodedInformation)
+}
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r echo=FALSE,message=FALSE}
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  require(grid)
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots <- length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(
+      seq(1, cols * ceiling(numPlots / cols)),
+      ncol = cols, nrow = ceiling(numPlots / cols)
+    )
+  }
+
+  if (numPlots == 1) {
+    print(plots[[1]])
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(
+        layout.pos.row = matchidx$row,
+        layout.pos.col = matchidx$col
+      ))
+    }
+  }
+}
+```
+
+### Introduction  
+
+This is an basic Exploratory Data Analysis for the [NYC Taxi Ride Duration](https://www.kaggle.com/c/nyc-taxi-trip-duration) competition.  
+
+New York City taxi rides paint a vibrant picture of life in the city. The millions of rides taken each month can provide insight into traffic patterns, road blockage, or large-scale events that attract many New Yorkers. With ridesharing apps gaining popularity, it is increasingly important for taxi companies to provide visibility to their estimated fare and
+ride duration, since the competing apps provide these metrics upfront. Predicting fare and duration of a ride can help passengers decide when is the optimal time to start their commute.
+
+The primary goal of this project is to predict trip duration of NYC Taxis based on features like trip coordinates, duration date and time. Training dataset has close to 1.5 Million and 630k records in test dataset. Each row contains one taxi trip. 
+
+
+#### Load required Packages    
+
+* Predominantly we have used dplyr, ggplot2 and lubridate packges   
+
+```{r message=FALSE, warning=FALSE}
+
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(ggmap)
+library(stringr)
+library(scales)
+library(gridExtra)
+library(corrplot)
+library(RColorBrewer)
+library(geosphere)
+library(tibble)
+library(forcats)
+library(xgboost)
+library(caret)
+library(leaflet)
+library(maps)
+library(readr)
+```
+
+
+#### Load Data     
+
+We are using Read CSV function to read test, train and submission file data into R.  
+
+```{r}
+taxi <- read.csv("train.csv")
+test <- read.csv("test.csv")
+submit <- read.csv("sample_submission.csv")
+```
+
+#### File Structure & Integrity 
+
+In this section we are checking the summary of Taxi Records and also check if any BLANKS or NA   values present. 
+
+```{r }
+glimpse(taxi)
+taxi <- data.frame(taxi)
+test <- data.frame(test)
+submit <- data.frame(submit)
+```
+
+We find below observations on Taxi Records  
+
+* Trip *Id* is unique identification of a trip
+
+* *vendor_id*  field has only 2 values "1" or "2" asuming two taxi companies  
+
+* *pickup/dropoff_datetime* - holds date and time of pickup and dropoff. we need to mutate the fields to get date and time seperately.  
+
+* *pickup/dropoff_longitute/latitute* - hold values of geographical coordinates where the meter was activate/deactivated.  
+
+* *store_and_fwd_flag* is a flag that indicates whether the trip data was sent immediately to the vendor ("N") or held in the memory of the taxi because there was no connection to the server ("Y"). Maybe there could be a correlation with certain geographical areas with bad   reception?  
+
+* *trip_duration* hold the duration in seconds and its our target prediction of ths project. 
+
+* Please note Test data will not have actual trip duration data. We have to submit the data in Kaggle to know the model score. 
+
+**Lets check the missing values of Taxi  and Test Records ** 
+
+```{r}
+sum(is.na(taxi))
+sum(is.na(test))
+```
+
+We have received Zero count. So we dont have any missing values in Dataset. 
+
+In preparation for our eventual modelling analysis we combine the Test and Train(Taxi) records into a single one. 
+
+```{r message=FALSE,warning=FALSE }
+combine <- bind_rows(
+  taxi %>% mutate(dset = "train"),
+  test %>% mutate(
+    dset = "test",
+    dropoff_datetime = NA,
+    trip_duration = NA
+  )
+)
+combine <- combine %>% mutate(dset = factor(dset))
+```
+
+
+#### Reformating data for our analysis 
+
+For our analysis, we will date fields from characters into date objects. We also change vendor_id as a factor. This makes it easier to visualise relationships that involve these features.
+
+
+```{r}
+taxi <- taxi %>% mutate(
+  pickup_datetime = ymd_hms(pickup_datetime),
+  dropoff_datetime = ymd_hms(dropoff_datetime),
+  vendor_id = factor(vendor_id),
+  passenger_count = factor(passenger_count)
+)
+```
+
+
+#### Consistency check
+
+This code is to check *trip_durations* are consistent with the intervals between  *pickup_datetime* and *dropoff_datetime*.  
+
+Actual count of Taxi file is `r count(taxi)`. Count of below check should the same else the records are inconsistent.  
+
+```{r}
+taxi %>%
+  mutate(check = abs(int_length(interval(dropoff_datetime, pickup_datetime)) + trip_duration) > 0) %>%
+  select(check, pickup_datetime, dropoff_datetime, trip_duration) %>%
+  group_by(check) %>%
+  count()
+```
+
+### Feature Visualizations
+
+We are starting with NYC Map to check where the most of pickup and dropoff are happening. We took 5000 samples from Taxi file and plotted.  It turns out that almost all of our trips were in fact taking place in Manhattan only.  
+
+```{r fig.align = 'default', warning = FALSE, out.width="100%", message=FALSE}
+
+my_map <- get_map(location = "New York City", zoom = 12, maptype = "roadmap", source = "google", color = "color")
+set.seed(1234)
+tax_samp <- sample_n(taxi, 5000)
+ggmap(my_map) +
+  geom_point(data = tax_samp, aes(x = pickup_longitude, y = pickup_latitude), size = 0.3, alpha = 0.3, color = "blue") +
+  geom_point(data = tax_samp, aes(x = dropoff_longitude, y = dropoff_latitude), size = 0.3, alpha = 0.3, color = "red") +
+  theme(axis.ticks = element_blank(), axis.text = element_blank())
+```
+
+Below analysis to check if any abnormal trip duration exists in our data. 
+
+```{r}
+taxi %>%
+  arrange(desc(trip_duration)) %>%
+  select(trip_duration, pickup_datetime, dropoff_datetime) %>%
+  head(5)
+
+taxi %>%
+  arrange(desc(trip_duration)) %>%
+  select(trip_duration, pickup_datetime, dropoff_datetime) %>%
+  tail(5)
+```
+
+Lets check the distributions of pickup_datetime and dropoff_datetime by year. 
+
+```{r message=FALSE}
+p1 <- taxi %>%
+  ggplot(aes(x = pickup_datetime)) +
+  geom_histogram(fill = "red", colour = "white", bins = 180) +
+  scale_x_datetime(date_breaks = "1 week", date_labels = "%W%b") +
+  labs(x = "Pickup dates week/month") +
+  theme(axis.text.x = element_text(angle = 90))
+
+p2 <- taxi %>%
+  ggplot(aes(dropoff_datetime)) +
+  geom_histogram(fill = "blue", colour = "white", bins = 180) +
+  scale_x_datetime(date_breaks = "1 week", date_labels = "%W%b") +
+  labs(x = "Dropoff dates week/month") +
+  theme(axis.text.x = element_text(angle = 90))
+
+layout <- matrix(c(1, 2), 2, 1, byrow = FALSE)
+multiplot(p1, p2, layout = layout)
+```
+
+
+
+
+
+In the below plot we are checking passenger count, vendor_id, total number of pickups on hour/day distribution. 
+
+```{r echo=FALSE,fig.align = 'default', warning = FALSE, out.width="100%", message=FALSE}
+P1 <- taxi %>%
+  group_by(passenger_count) %>%
+  count() %>%
+  ggplot(aes(passenger_count, n, fill = passenger_count)) +
+  geom_col() +
+  scale_y_sqrt() + scale_fill_brewer(palette = "Set1") +
+  labs(x = "Passenger Count", y = "Total number of pickups") +
+  theme(legend.position = "none")
+
+P2 <- taxi %>%
+  ggplot(aes(vendor_id, fill = vendor_id)) +
+  geom_bar(position = "dodge") +
+  scale_fill_brewer(palette = "Set1") +
+  theme(legend.position = "none")
+
+P3 <- taxi %>%
+  ggplot(aes(store_and_fwd_flag, fill = vendor_id)) +
+  geom_bar(stat = "count", position = "dodge", alpha = 0.6) +
+  theme(legend.position = "none") +
+  scale_y_log10()
+
+P4 <- taxi %>%
+  mutate(wday = wday(pickup_datetime, label = TRUE)) %>%
+  group_by(wday, vendor_id) %>%
+  count() %>%
+  ggplot(aes(wday, n, fill = vendor_id)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_brewer(palette = "Set1") +
+  labs(x = "Day of the week", y = "Total number of pickups") +
+  theme(legend.position = "none")
+
+P5 <- taxi %>%
+  mutate(hpick = hour(pickup_datetime)) %>%
+  group_by(hpick) %>%
+  count() %>%
+  ggplot(aes(hpick, n)) +
+  geom_smooth(method = "loess", span = 1 / 2) +
+  geom_point(size = 4, colour = "blue") +
+  labs(x = "Hour of the day", y = "Total number of pickups") +
+  theme(legend.position = "none")
+
+layout <- matrix(c(1, 2, 3, 4, 5, 5), 3, 2, byrow = TRUE)
+multiplot(P1, P2, P3, P4, P5, layout = layout)
+```
+
+
+* We found some abnormal trip with zero passenger and more 7 passengers  
+* We find an interesting pattern with Monday being the quietest day and Friday very busy.  
+* we find evening hours are busiest hours of the day.  
+
+Now lets check how the trends in different vizualization.   
+
+* We find Jan and June has less number of trips 
+* We find During weekends early morning are busy 
+
+```{r fig.align = 'default', warning = FALSE, out.width="100%", message=FALSE}
+p1 <- taxi %>%
+  mutate(
+    hpick = hour(pickup_datetime),
+    Month = factor(month(pickup_datetime, label = TRUE))
+  ) %>%
+  group_by(hpick, Month) %>%
+  count() %>%
+  ggplot(aes(hpick, n, color = Month)) +
+  geom_line(size = 1.5) +
+  labs(x = "Hour of the day", y = "count")
+
+p2 <- taxi %>%
+  mutate(
+    hpick = hour(pickup_datetime),
+    wday = factor(wday(pickup_datetime, label = TRUE))
+  ) %>%
+  group_by(hpick, wday) %>%
+  count() %>%
+  ggplot(aes(hpick, n, color = wday)) +
+  geom_line(size = 1.5) +
+  labs(x = "Hour of the day", y = "count")
+
+layout <- matrix(c(1, 2), 2, 1, byrow = FALSE)
+multiplot(p1, p2, layout = layout)
+```
+
+#### In the next slides we trying find the relation between the trip duration and picking up data & time. This will help us identify how strongly correlated to add them in the model. 
+
+```{r fig.align = 'default', warning = FALSE, out.width="100%", message=FALSE}
+p1 <- taxi %>%
+  mutate(wday = wday(pickup_datetime, label = TRUE)) %>%
+  group_by(wday, vendor_id) %>%
+  summarise(median_duration = median(trip_duration) / 60) %>%
+  ggplot(aes(wday, median_duration, color = vendor_id)) +
+  geom_point(size = 4) +
+  scale_colour_brewer(palette = "Set1") +
+  labs(x = "Day of the week", y = "Median duration [min]") +
+  theme(panel.background = element_rect(fill = "white"))
+
+p2 <- taxi %>%
+  mutate(pickt = hour(pickup_datetime)) %>%
+  group_by(pickt, vendor_id) %>%
+  summarise(median_duration = median(trip_duration) / 60) %>%
+  ggplot(aes(pickt, median_duration, color = vendor_id)) +
+  geom_smooth(method = "loess", span = 1 / 2) +
+  geom_point(size = 4) +
+  scale_colour_brewer(palette = "Set1") +
+  labs(x = "Hour of the day", y = "Median duration [min]") +
+  theme(legend.position = "none")
+
+layout <- matrix(c(1, 2), 2, 1, byrow = FALSE)
+multiplot(p1, p2, layout = layout)
+```
+
+In the our next slide, we are checking for any correlation between passenger count and trip duration. 
+
+```{r fig.align = 'default', warning = FALSE, out.width="100%", message=FALSE}
+taxi %>%
+  group_by(passenger_count, vendor_id) %>%
+  summarise(median_duration = median(trip_duration) / 60) %>%
+  ggplot(aes(passenger_count, median_duration, fill = passenger_count)) +
+  geom_bar(stat = "identity") +
+  scale_y_log10() +
+  theme(legend.position = "none") +
+  facet_wrap(~ vendor_id) +
+  labs(y = "Trip duration", x = "Number of passengers")
+```
+
+
+### Relation between Time and Direct distance
+
+In this section we are trying to find out the relation between drip duration and direct distance. To derive direct distance, we are using "Geosphere" package. Also, we are trying to find out any significance counts trips made out of Manhattan. Two major airports attract more taxi rides from city. We need to find how significant they are for our modelling.  
+
+```{r echo=FALSE}
+jfk_coord <- tibble(lon = -73.778889, lat = 40.639722)
+la_guardia_coord <- tibble(lon = -73.872611, lat = 40.77725)
+
+pick_coord <- taxi %>%
+  select(pickup_longitude, pickup_latitude)
+drop_coord <- taxi %>%
+  select(dropoff_longitude, dropoff_latitude)
+
+taxi$dist <- distCosine(pick_coord, drop_coord)
+taxi$jfk_dist_pick <- distCosine(pick_coord, jfk_coord)
+taxi$jfk_dist_drop <- distCosine(drop_coord, jfk_coord)
+taxi$lg_dist_pick <- distCosine(pick_coord, la_guardia_coord)
+taxi$lg_dist_drop <- distCosine(drop_coord, la_guardia_coord)
+
+taxi <- taxi %>%
+  mutate(
+    speed = (dist / trip_duration * 2.236),
+    date = date(pickup_datetime),
+    month = month(pickup_datetime, label = TRUE),
+    wday = wday(pickup_datetime, label = TRUE),
+    wday = fct_relevel(wday, c("Mon", "Tues", "Wed", "Thurs", "Fri", "Sat", "Sun")),
+    hour = hour(pickup_datetime),
+    work = (hour %in% seq(8, 18)) & (wday %in% c("Mon", "Tues", "Wed", "Thurs", "Fri")),
+    jfk_trip = (jfk_dist_pick < 2e3) | (jfk_dist_drop < 2e3),
+    lg_trip = (lg_dist_pick < 2e3) | (lg_dist_drop < 2e3)
+  )
+```
+
+Lets plot relationship trip duration and distance
+
+```{r fig.align = 'default', warning = FALSE, out.width="100%", message=FALSE}
+set.seed(1234)
+taxi %>%
+  sample_n(5000) %>%
+  ggplot(aes(dist, trip_duration)) +
+  geom_point(color = "blue", alpha = 0.4) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "Direct distance[meters]", y = "Trip duration[seconds]")
+```
+
+* Its clear observation, that distance increases trip duration. 
+
+Lets visualize how speed new york taxis travelling during peak hours and weekends. In order to find bogus values in the datasets, we can find extreme speed records and eliminate them 
+
+```{r}
+taxi %>%
+  ggplot(aes(speed)) +
+  geom_histogram(fill = "purple", bins = 50) +
+  scale_x_continuous(limits = c(0, 100)) +
+  labs(x = "Average speed [Miles/hr] (direct distance)")
+```
+
+Plotting speed on different times using heat map. 
+
+```{r fig.align = 'default', warning = FALSE, out.width="100%", message=FALSE}
+P1 <- taxi %>%
+  group_by(wday, hour) %>%
+  summarise(median_speed = median(speed)) %>%
+  ggplot(aes(hour, wday, fill = median_speed)) +
+  geom_tile() +
+  labs(x = "Hour of the day", y = "Day of the week") +
+  scale_fill_distiller(palette = "Spectral")
+layout <- matrix(c(1, 1), 1, 1, byrow = TRUE)
+multiplot(P1, layout = layout)
+```
+
+Airport trips has significant number of counts. Since airports are usually not in the city center it is reasonable to assume that the pickup/dropoff distance from the airport could be a useful predictor for longer trip_duration. We have derived a trip is JFK/La Gaurdia based on distance between pickup/dropoff location and airport coordinates. If its near to them, then we assume they are airport trips. 
+
+Let's visualize the how significantly trip duration increased for the airport trips. Based on below plot, its evident aiport trips are longer than regular trip to diff parts of city. 
+
+
+```{r fig.align = 'default', warning = FALSE, out.width="100%", message=FALSE}
+p1 <- taxi %>%
+  filter(trip_duration < 23 * 3600) %>%
+  ggplot(aes(jfk_trip, trip_duration, fill = jfk_trip)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  scale_fill_brewer(palette = "Set1") +
+  theme(legend.position = "none") +
+  labs(x = "JFK trip")
+
+p2 <- taxi %>%
+  filter(trip_duration < 23 * 3600) %>%
+  ggplot(aes(lg_trip, trip_duration, fill = lg_trip)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  scale_fill_brewer(palette = "Set1") +
+  theme(legend.position = "none") +
+  labs(x = "La Guardia trip")
+
+layout <- matrix(c(1, 2), 1, 2, byrow = FALSE)
+multiplot(p1, p2, layout = layout)
+```
+
+#### Data Cleaning.
+
+The aim here is to remove trips that have improbable features, such as extreme trip durations or very low average speed.
+
+** Filter trips more than 24 hours. 
+
+```{r}
+long_hrtrips <- taxi %>%
+  filter(trip_duration > 24 * 3600)
+
+long_hrtrips %>%
+  arrange(desc(dist)) %>%
+  select(pickup_datetime, dropoff_datetime, speed) %>%
+  head(05)
+```
+
+** Filter trips shorter than a few minutes
+
+```{r}
+min_trips <- taxi %>%
+  filter(trip_duration < 5 * 60)
+
+min_trips %>%
+  arrange(dist) %>%
+  select(dist, pickup_datetime, dropoff_datetime, speed) %>%
+  head(05)
+```
+
+** Find trip with zero miles 
+
+```{r}
+zero_dist <- taxi %>%
+  filter(near(dist, 0))
+nrow(zero_dist)
+```
+
+** Find trips away from New York 
+
+```{r fig.align = 'default', warning = FALSE,  out.width="100%", message=FALSE}
+long_dist <- taxi %>%
+  filter((jfk_dist_pick > 3e5) | (jfk_dist_drop > 3e5))
+long_dist <- data.frame(long_dist)
+long_dist_coord <- long_dist %>%
+  select(lon = pickup_longitude, lat = pickup_latitude)
+
+my_map1 <- get_map(location = "United States", zoom = 4, maptype = "roadmap", source = "google", color = "color")
+ggmap(my_map1) +
+  geom_point(data = long_dist, aes(x = pickup_longitude, y = pickup_latitude), size = 6, alpha = 0.6, color = "blue") +
+  theme(axis.ticks = element_blank(), axis.text = element_blank())
+```
+
+#### Filter all bogus data from taxi dataset
+
+```{r}
+taxi <- taxi %>%
+  filter(
+    trip_duration < 22 * 3600,
+    dist > 0 | (near(dist, 0) & trip_duration < 60),
+    jfk_dist_pick < 3e5 & jfk_dist_drop < 3e5,
+    trip_duration > 10,
+    speed < 100
+  )
+```
+
+#### External data
+
+We are adding Open Source Routing Machine, [OSRM](http://project-osrm.org/) data for each trip. This data is  provided by oscarleo and we can download data from [here](https://www.kaggle.com/oscarleo/new-york-city-taxi-with-osrm) and includes the pickup/dropoff streets and total distance/duration between these two points together with a sequence of travels steps such as turns or entering a highway.
+
+```{r warning=FALSE}
+fast1 <- read.csv("fastest_train_part_1.csv")
+fast2 <- read.csv("fastest_train_part_2.csv")
+ftest <- read.csv("fastest_routes_test.csv")
+fast1 <- data.frame(fast1)
+fast2 <- data.frame(fast2)
+ftest <- data.frame(ftest)
+
+fastest_route <- bind_rows(fast1, fast2, ftest)
+glimpse(fastest_route)
+```
+ 
+Lets visualize few of the important data points in Historgram to see the distribution. 
+
+```{r fig.align = 'default', warning = FALSE, out.width="100%", message=FALSE}
+p1 <- fastest_route %>%
+  ggplot(aes(total_travel_time)) +
+  geom_histogram(bins = 150, fill = "red") +
+  scale_x_log10() +
+  scale_y_sqrt()
+
+p2 <- fastest_route %>%
+  ggplot(aes(total_distance)) +
+  geom_histogram(bins = 150, fill = "red") +
+  scale_x_log10() +
+  scale_y_sqrt()
+
+p3 <- fastest_route %>%
+  ggplot(aes(number_of_steps)) +
+  geom_bar(fill = "red")
+layout <- matrix(c(1, 2, 3), 1, 3, byrow = TRUE)
+multiplot(p1, p2, p3, layout = layout)
+```
+
+#### Joining OSRM file and TAXI file for further analysis. 
+
+In a first look at the joined data, we will mainly focus on the total_distance and total_travel_time, when combined with our original training data set:
+
+```{r}
+osrm <- fastest_route %>%
+  select(
+    id, total_distance, total_travel_time, number_of_steps,
+    step_direction, step_maneuvers
+  ) %>%
+  mutate(
+    fastest_speed = total_distance / total_travel_time * 2.236,
+    left_turns = str_count(step_direction, "left"),
+    right_turns = str_count(step_direction, "right"),
+    turns = str_count(step_maneuvers, "turn")
+  ) %>%
+  select(-step_direction, -step_maneuvers)
+
+taxi <- left_join(taxi, osrm, by = "id")
+```
+
+In order to consider fastest route file for modeling, we need to find out total_travel_time in OSRM vs drip_duration recorded in taxi file. 
+
+```{r message=FALSE,warning=FALSE}
+
+p1 <- taxi %>%
+  ggplot(aes(trip_duration)) +
+  geom_density(fill = "red", alpha = 0.5) +
+  geom_density(aes(total_travel_time), fill = "blue", alpha = 0.5) +
+  scale_x_log10() +
+  coord_cartesian(xlim = c(5e1, 8e3))
+```
+
+Check for trip distance aswell. 
+
+```{r message=FALSE,warning=FALSE}
+taxi %>%
+  ggplot(aes(dist)) +
+  geom_density(fill = "red", alpha = 0.5) +
+  geom_density(aes(total_distance), fill = "blue", alpha = 0.5) +
+  scale_x_log10() +
+  coord_cartesian(xlim = c(2e2, 5e4))
+```  
+
+#### Correlation Matrix 
+
+Lets vizualize the relations between our variables using correlation matrix. We are using corrplot package for   plotting. 
+
+NOTE: To resolve memory issue, we have run the corrplot outside markdown and attached screenshot below. 
+
+```{r message=FALSE,warning=FALSE}
+# taxi %>%
+#   select(
+#     -id, -pickup_datetime, -dropoff_datetime, -jfk_dist_pick,
+#     -jfk_dist_drop, -lg_dist_pick, -lg_dist_drop, -date
+#   ) %>%
+#   mutate(
+#     passenger_count = as.integer(passenger_count),
+#     vendor_id = as.integer(vendor_id),
+#     store_and_fwd_flag = as.integer(as.factor(store_and_fwd_flag)),
+#     jfk_trip = as.integer(jfk_trip),
+#     wday = as.integer(wday),
+#     month = as.integer(month),
+#     work = as.integer(work),
+#     lg_trip = as.integer(lg_trip)
+#   ) %>%
+#   select(trip_duration, speed, everything()) %>%
+#   cor(use = "complete.obs", method = "spearman") %>%
+#   corrplot(type = "lower", method = "number", diag = FALSE)
+```
+
+```{r fig.align = 'default', warning = FALSE, out.width="100%", echo=FALSE}
+knitr::include_graphics("Corr_Plot.jpg", auto_pdf = TRUE)
+```
+
+* The strongest correlations with the trip_duration are seen for the direct distance as well as the total_distance and total_travel_time derived from the OSRM data. 
+
+* Number of turns, presumably mostly via the number_of_steps, are having an impact on the trip_duration.
+
+* Another effect on the trip_duration can be seen for our engineered features jfk_trip and lg_trip indicating journeys to either airport.
+
+* Features like store_and_fwd_flag, vendor_id, passenger_count, speed are having little to no correlation,  So we are removing from our model. 
+
+
+### Model Selection and Prediction   
+
+Next is our most important step to find best method to predict the duration. We gonna test model our data with  XGBoost.
+
+We will start with XGBoost model now. Inorder to make sure we are training a feature which is relevent to test data. Plotting Test and Training Data overlap to see they are relevent. 
+
+```{r}
+Temp1 <- combine %>%
+  mutate(date = date(ymd_hms(pickup_datetime))) %>%
+  group_by(date, dset) %>%
+  count()
+Temp1 %>%
+  ggplot(aes(date, n, color = dset)) +
+  geom_line(size = 1.5) +
+  labs(x = "", y = "Trips per day")
+```
+
+*** Data formatting 
+
+Here we will format the selected features to turn them into integer columns, since many classifiers cannot deal with categorical values. We have formated Taxi data already. However, we need to redo same formating with combined records which intially joined both train and test data.  
+
+```{r}
+# airport coordinates again
+jfk_coord <- tibble(lon = -73.778889, lat = 40.639722)
+la_guardia_coord <- tibble(lon = -73.872611, lat = 40.77725)
+
+# derive distances
+pick_coord <- combine %>%
+  select(pickup_longitude, pickup_latitude)
+drop_coord <- combine %>%
+  select(dropoff_longitude, dropoff_latitude)
+combine$dist <- distCosine(pick_coord, drop_coord)
+combine$bearing <- bearing(pick_coord, drop_coord)
+
+combine$jfk_dist_pick <- distCosine(pick_coord, jfk_coord)
+combine$jfk_dist_drop <- distCosine(drop_coord, jfk_coord)
+combine$lg_dist_pick <- distCosine(pick_coord, la_guardia_coord)
+combine$lg_dist_drop <- distCosine(drop_coord, la_guardia_coord)
+
+combine <- combine %>%
+  mutate(
+    pickup_datetime = ymd_hms(pickup_datetime),
+    dropoff_datetime = ymd_hms(dropoff_datetime),
+    date = date(pickup_datetime)
+  )
+# join OSRM data with our data.
+combine <- left_join(combine, osrm, by = "id")
+```
+
+Reformat data in to integer format.   
+
+```{r}
+combine <- combine %>%
+  mutate(
+    store_and_fwd_flag = as.integer(factor(store_and_fwd_flag)),
+    vendor_id = as.integer(vendor_id),
+    month = as.integer(month(pickup_datetime)),
+    wday = wday(pickup_datetime, label = TRUE),
+    wday = as.integer(fct_relevel(wday, c("Sun", "Sat", "Mon", "Tues", "Wed", "Thurs", "Fri"))),
+    hour = hour(pickup_datetime),
+    work = as.integer((hour %in% seq(8, 18)) & (wday %in% c("Mon", "Tues", "Fri", "Wed", "Thurs"))),
+    jfk_trip = as.integer((jfk_dist_pick < 2e3) | (jfk_dist_drop < 2e3)),
+    lg_trip = as.integer((lg_dist_pick < 2e3) | (lg_dist_drop < 2e3))
+  )
+```
+
+Just to make sure our data is in proper format. 
+
+```{r}
+glimpse(combine)
+```
+
+Next, we are selecting Feature to be in the model. I have run the feature selection outside this document, to select optimal features which gives less RMSLE values. Based on that below are the selected Features will be used across all algorithms. Our evaluation metic is [Root Mean Squared Logarithmic Error](https://www.kaggle.com/c/nyc-taxi-trip-duration#evaluation). In order to easily simulate the evaluation metric in our model fitting we replace the trip_duration with its logarithm. We adding +1 to duration to avoid infinity value incase of zeros. 
+
+```{r}
+
+# predictor variables
+train_cols <- c(
+  "total_travel_time", "total_distance", "hour", "dist",
+  "vendor_id", "jfk_trip", "lg_trip", "wday", "month",
+  "pickup_longitude", "pickup_latitude", "lg_dist_drop", "jfk_dist_drop"
+)
+# target variable
+y_col <- c("trip_duration")
+# id feature
+id_col <- c("id")
+# auxilliary varaible
+aux_cols <- c("dset")
+# cleaning variable
+clean_cols <- c("jfk_dist_drop", "jfk_dist_pick")
+# ---------------------------------
+
+# General extraction
+# ---------------------------------
+# extract test id column
+test_id <- combine %>%
+  filter(dset == "test") %>%
+  select_(.dots = id_col)
+
+# all relevant columns for train/test
+cols <- c(train_cols, y_col, aux_cols, clean_cols)
+combine <- combine %>%
+  select_(.dots = cols)
+
+# split train/test
+train <- combine %>%
+  filter(dset == "train") %>%
+  select_(.dots = str_c("-", c(aux_cols)))
+test <- combine %>%
+  filter(dset == "test") %>%
+  select_(.dots = str_c("-", c(aux_cols, clean_cols, y_col)))
+
+# convert trip_duration to log
+
+train <- train %>%
+  mutate(trip_duration = log(trip_duration + 1))
+```
+
+To assess the mode performance we will run a cross-validation step and also split our training data into a *train* vs *validation* data set. Thereby, the model performance can be evaluated on a sample that the algorithm has not seen. We split our data into 80/20 fractions using a tool from the [caret package](https://cran.r-project.org/web/packages/caret/index.html).
+
+```{r}
+set.seed(4321)
+trainIndex <- createDataPartition(train$trip_duration, p = 0.8, list = FALSE, times = 1)
+
+train <- train[trainIndex, ]
+valid <- train[-trainIndex, ]
+```
+
+Next we clean the date before we start processng the date. We will do celaning only on Training dataset inorder to identify overfitting if we see any variance with Validation dataset. 
+
+
+```{r}
+valid <- valid %>%
+  select_(.dots = str_c("-", c(clean_cols)))
+
+train <- train %>%
+  filter(
+    trip_duration < 24 * 3600,
+    jfk_dist_pick < 3e5 & jfk_dist_drop < 3e5
+  ) %>%
+  select_(.dots = str_c("-", c(clean_cols)))
+```
+
+
+### XGBoost parameters and fitting
+
+In order for *XGBoost* to properly ingest our data samples we need to re-format them slightly:
+
+```{r}
+# convert to XGB matrix
+temptrn <- train %>% select(-trip_duration)
+tempval <- valid %>% select(-trip_duration)
+
+dtrain <- xgb.DMatrix(as.matrix(temptrn), label = train$trip_duration)
+dvalid <- xgb.DMatrix(as.matrix(tempval), label = valid$trip_duration)
+dtest <- xgb.DMatrix(as.matrix(test))
+```
+
+Now we define the meta-parameters that govern how *XGBoost* operates. See [here](https://www.hackerearth.com/practice/machine-learning/machine-learning-algorithms/beginners-tutorial-on-xgboost-parameter-tuning-r/tutorial/) for more details. The *watchlist* parameter tells the algorithm to keep an eye on both the *training* and *validation* sample metrics.
+
+```{r}
+xgb_params <- list(
+  colsample_bytree = 0.7, # variables per tree
+  subsample = 0.7, # data subset per tree
+  booster = "gbtree",
+  max_depth = 5, # tree levels
+  eta = 0.3, # shrinkage
+  eval_metric = "rmse",
+  objective = "reg:linear",
+  seed = 4321
+)
+
+watchlist <- list(train = dtrain, valid = dvalid)
+```
+
+And here we *train* our classifier, i.e. fit it to the *training* data. To ensure reproducability we set an R seed here.
+
+NOTE: Recuing number of rounds to 60 due to memory and cpu issues. Actual submission model was trined with 100 rounds. 
+
+```{r train_xgboost}
+set.seed(4321)
+gb_dt <- xgb.train(
+  params = xgb_params,
+  data = dtrain,
+  print_every_n = 10,
+  watchlist = watchlist,
+  nrounds = 60
+)
+```
+
+After the fitting we are running a 5-fold cross-validation (CV) to estimate our model's performance.
+
+NOTE: Reducing number of rounds to 60 due to memory and cpu issue. 
+
+```{r xross_validation}
+xgb_cv <- xgb.cv(xgb_params, dtrain, early_stopping_rounds = 10, nfold = 5, nrounds = 60)
+```
+
+## Feature importance
+
+After training we will check which features are the most important for our model. This can provide the starting point for an iterative process where we identify, step by step, the significant features for a model. Here we will simply visualise these features:
+```{r imp_matrix_plot}
+imp_matrix <- as.tibble(xgb.importance(feature_names = colnames(train %>% select(-trip_duration)), model = gb_dt))
+
+imp_matrix %>%
+  ggplot(aes(reorder(Feature, Gain, FUN = max), Gain, fill = Feature)) +
+  geom_col() +
+  coord_flip() +
+  theme(legend.position = "none") +
+  labs(x = "Features", y = "Importance")
+```
+
+Write the XGBoost prediction to csv file and later will submit in Kaggle to know the actual score. Please refer below screenshot to see submission score. 
+
+```{r write_prediction }
+test_preds <- predict(gb_dt, dtest)
+pred <- test_id %>%
+  mutate(trip_duration = exp(test_preds) - 1)
+
+pred %>% write_csv("submit_XGBOOST.csv")
+```
+
+We have to compare the prediction file trip ids are matching with submit file Id. Also we have to checking the 
+
+```{r Plot_prediction}
+identical(dim(submit), dim(pred))
+glimpse(submit)
+glimpse(pred)
+bind_cols(submit, pred) %>% head(5)
+
+trntemp <- train %>%
+  select(trip_duration) %>%
+  mutate(
+    dset = "train",
+    trip_duration = exp(trip_duration) - 1
+  )
+predtmp <- pred %>%
+  mutate(dset = "predict")
+
+bind_rows(trntemp, predtmp) %>%
+  ggplot(aes(trip_duration, fill = dset)) +
+  geom_density(alpha = 0.5) +
+  scale_x_log10()
+```
+
+Final Score calcualted by Kaggle 
+
+```{r fig.align = 'default', warning = FALSE, out.width="100%", echo=FALSE}
+knitr::include_graphics("Submission.png", auto_pdf = TRUE)
+```
+
+####References: 
+
+* EDA - NYC TAXI EDA The fast & the curious [LINK](https://www.kaggle.com/headsortails/nyc-taxi-eda-update-the-fast-the-curious/notebook)
+
+* EDA - From EDA to the Top (LB 0.367) [LINK](https://www.kaggle.com/gaborfodor/from-eda-to-the-top-lb-0-367)
+
+* Mapping techniques  [LINK](http://tutorials.iq.harvard.edu/R/Rgraphics/Rgraphics.html)
+
+* GGPLOT [LINK](http://r-statistics.co/Complete-Ggplot2-Tutorial-Part1-With-R-Code.html?)
+
+* Machine Learning [LINK](https://www.analyticsvidhya.com/blog/2017/09/common-machine-learning-algorithms/)
+
+* XGBOOST Basics [LINK](https://www.hackerearth.com/practice/machine-learning/machine-learning-algorithms/beginners-tutorial-on-xgboost-parameter-tuning-r/tutorial/)
